@@ -15,6 +15,34 @@
  */
 package io.micronaut.annotation.processing;
 
+import static java.util.stream.Collectors.toList;
+import static javax.lang.model.element.ElementKind.FIELD;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import javax.annotation.processing.ProcessingEnvironment;
+import javax.annotation.processing.RoundEnvironment;
+import javax.annotation.processing.SupportedOptions;
+import javax.lang.model.element.Element;
+import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.VariableElement;
+import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeMirror;
+import javax.lang.model.util.ElementScanner8;
+
+import edu.umd.cs.findbugs.annotations.NonNull;
 import io.micronaut.annotation.processing.visitor.LoadedVisitor;
 import io.micronaut.aop.Introduction;
 import io.micronaut.context.annotation.Requires;
@@ -27,26 +55,10 @@ import io.micronaut.core.order.OrderUtil;
 import io.micronaut.core.util.StringUtils;
 import io.micronaut.core.version.VersionUtils;
 import io.micronaut.inject.annotation.AnnotationMetadataHierarchy;
+import io.micronaut.inject.beans.visitor.IntrospectedTypeElementVisitor;
 import io.micronaut.inject.processing.JavaModelUtils;
 import io.micronaut.inject.visitor.TypeElementVisitor;
 import io.micronaut.inject.visitor.VisitorContext;
-import edu.umd.cs.findbugs.annotations.NonNull;
-import javax.annotation.processing.ProcessingEnvironment;
-import javax.annotation.processing.RoundEnvironment;
-import javax.annotation.processing.SupportedOptions;
-import javax.lang.model.element.Element;
-import javax.lang.model.element.ExecutableElement;
-import javax.lang.model.element.TypeElement;
-import javax.lang.model.element.VariableElement;
-import javax.lang.model.type.DeclaredType;
-import javax.lang.model.type.TypeMirror;
-import javax.lang.model.util.ElementScanner8;
-
-import java.util.*;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
-
-import static javax.lang.model.element.ElementKind.FIELD;
 
 /**
  * <p>The annotation processed used to execute type element visitors.</p>
@@ -66,12 +78,14 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
 
     private List<LoadedVisitor> loadedVisitors;
     private Collection<TypeElementVisitor> typeElementVisitors;
+    private Set<String> beanDefinitions;
 
     @Override
     public synchronized void init(ProcessingEnvironment processingEnv) {
 
         super.init(processingEnv);
 
+        beanDefinitions = new HashSet<>();
         this.typeElementVisitors = findTypeElementVisitors();
 
         // set supported options as system properties to keep compatibility
@@ -179,9 +193,7 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
 
     @Override
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
-
         if (!loadedVisitors.isEmpty()) {
-
             TypeElement groovyObjectTypeElement = elementUtils.getTypeElement("groovy.lang.GroovyObject");
             TypeMirror groovyObjectType = groovyObjectTypeElement != null ? groovyObjectTypeElement.asType() : null;
 
@@ -193,15 +205,49 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
                     .filter(typeElement -> typeElement == null || (groovyObjectType == null || !typeUtils.isAssignable(typeElement.asType(), groovyObjectType)))
                     .forEach((typeElement) -> {
                         String className = typeElement.getQualifiedName().toString();
-                        List<LoadedVisitor> matchedVisitors = loadedVisitors.stream().filter((v) -> v.matches(typeElement)).collect(Collectors.toList());
+                        List<LoadedVisitor> matchedVisitors = loadedVisitors.stream().filter((v) -> v.matches(typeElement)).collect(toList());
+
+                        // IntrospectedTypeElementVisitor has to be handled after Lombok
+                        if (loadedVisitors.stream().anyMatch(v -> v.getVisitor().getClass().equals(IntrospectedTypeElementVisitor.class))) {
+                            beanDefinitions.add(className);
+                            matchedVisitors = loadedVisitors.stream()
+                                    .filter(v -> !v.getVisitor().getClass().equals(IntrospectedTypeElementVisitor.class))
+                                    .collect(toList());
+                        }
+
                         typeElement.accept(new ElementVisitor(typeElement, matchedVisitors), className);
                     });
 
             for (LoadedVisitor loadedVisitor : loadedVisitors) {
                 try {
-                    loadedVisitor.getVisitor().finish(javaVisitorContext);
+                    if (!loadedVisitor.getVisitor().getClass().equals(IntrospectedTypeElementVisitor.class)) {
+                        loadedVisitor.getVisitor().finish(javaVisitorContext);
+                    }
                 } catch (Throwable e) {
                     error("Error finalizing type visitor [%s]: %s", loadedVisitor.getVisitor(), e.getMessage());
+                }
+            }
+        }
+
+        if (roundEnv.processingOver()) {
+            Optional<LoadedVisitor> introspectedVisitor = loadedVisitors.stream()
+                    .filter(v -> v.getVisitor().getClass().equals(IntrospectedTypeElementVisitor.class))
+                    .findFirst();
+            if (introspectedVisitor.isPresent()) {
+                List<LoadedVisitor> matchedVisitors = Collections.singletonList(introspectedVisitor.get());
+                beanDefinitions.stream()
+                        .map(beanDefinition -> elementUtils.getTypeElement(beanDefinition))
+                        .forEach((typeElement) -> {
+                            String className = typeElement.getQualifiedName().toString();
+                            typeElement.accept(new ElementVisitor(typeElement, matchedVisitors), className);
+                        });
+
+                for (LoadedVisitor loadedVisitor : matchedVisitors) {
+                    try {
+                        loadedVisitor.getVisitor().finish(javaVisitorContext);
+                    } catch (Throwable e) {
+                        error("Error finalizing type visitor [%s]: %s", loadedVisitor.getVisitor(), e.getMessage());
+                    }
                 }
             }
         }
@@ -259,7 +305,7 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
     /**
      * The class to visit the type elements.
      */
-    private class ElementVisitor extends ElementScanner8<Object, Object> {
+    public class ElementVisitor extends ElementScanner8<Object, Object> {
 
         private final TypeElement concreteClass;
         private final List<LoadedVisitor> visitors;
